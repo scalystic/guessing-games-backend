@@ -1,0 +1,27 @@
+{
+  "name": "sargam-realtime-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone Socket.IO server for SARGAM multiplayer — deployed separately (Railway) from the main Next.js app (Vercel), sharing the same Postgres database.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "prisma generate",
+    "start": "tsx src/server.ts",
+    "db:generate": "prisma generate"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.9.1",
+    "@prisma/client": "^7.9.1",
+    "dotenv": "^17.4.2",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "prisma": "^7.9.1",
+    "tsx": "^4.23.12",
+    "typescript": "^5"
+  }
+}

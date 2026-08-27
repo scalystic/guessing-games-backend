@@ -1,0 +1,798 @@
+// MIRROR of the main app's prisma/schema.prisma — this server has its own
+// Prisma client generated from it, but connects to the SAME database. Never
+// run migrations from here (`prisma migrate ...`); only ever `prisma generate`.
+// Whenever the main app's schema changes, copy this file over again and
+// regenerate.
+//
+// Guessing Games — platform schema
+//
+// Design rules (see docs/game-engine.md for the full rationale):
+//   1. The platform layer (Player, Game, Puzzle, Run, RunRound, Guess, boards)
+//      is game-agnostic. Adding a second game = one Game row + one detail table.
+//   2. A Puzzle is the universal "one thing to guess" unit. Game-specific fields
+//      live in a 1:1 detail table keyed by puzzleId (see Song).
+//   3. Reveal stages are a shared concept — audio clips, blurred frames, and
+//      text snippets all fit PuzzleAsset.
+//   4. Difficulty is a property of the catalog, never of the ladder. It ramps
+//      WITHIN a run (popularity slides down round to round); there are no
+//      difficulty tiers to pick between.
+//   5. Ladder + popularity curve are DATA (tunable without deploy). The scoring
+//      formula is CODE, pinned per-run via scoringVersion so old runs stay
+//      explainable after a rebalance.
+
+// Prisma 7: the generator is `prisma-client` (not `prisma-client-js`), the
+// datasource carries no `url`, and the connection string lives in
+// prisma.config.ts. PrismaClient is constructed with a driver adapter — see
+// src/lib/db.ts.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================
+// Identity
+// ============================================================
+
+enum PlayerKind {
+  GUEST
+  USER
+}
+
+/// A player exists from the first tap — guests are real rows, which is what
+/// makes the signup merge a simple UPDATE rather than a data migration.
+model Player {
+  id   String     @id @default(cuid())
+  kind PlayerKind @default(GUEST)
+
+  displayName String?
+  /// Normalized unique handle, claimed at signup. Guests stay null.
+  handle      String? @unique
+  avatarUrl   String?
+
+  /// Set when kind = USER. Whatever auth adapter you pick owns its own tables;
+  /// this is the single join point into the game domain.
+  authUserId String? @unique
+  email      String? @unique
+  /// Bcrypt hash. Null for guests and OAuth-only users.
+  passwordHash String?
+  /// Grants access to /admin/*. No signup flow mints this — only an existing
+  /// admin or scripts/create-admin.ts. Re-checked from the DB on every admin
+  /// request, never trusted from the session JWT alone, so revoking it takes
+  /// effect on the very next request.
+  isAdmin Boolean @default(false)
+  /// Google OAuth Subject ID
+  googleId   String? @unique
+
+  xp    Int @default(0)
+  level Int @default(1)
+  coins Int @default(0)
+
+  countryCode String? @db.Char(2)
+  timezone    String?
+
+  /// Guest provenance for abuse throttling. Hashed — never store raw IPs.
+  createdIpHash String?
+
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  runs               Run[]
+  gameStats          PlayerGameStat[]
+  puzzleHistory      PlayerPuzzleHistory[]
+  ledger             LedgerEntry[]
+  leaderboardEntries LeaderboardEntry[]
+  claimedAsGuest     GuestClaim?           @relation("ClaimGuestSide")
+  claimsMade         GuestClaim[]          @relation("ClaimUserSide")
+  hostedRooms        MultiplayerRoom[]     @relation("RoomHost")
+  multiplayerRooms   MultiplayerRoomPlayer[]
+
+  @@index([kind, lastSeenAt])
+}
+
+/// One-way, once-only: a guest's progress folds into a real account at signup.
+/// The unique on guestPlayerId is the whole enforcement mechanism.
+model GuestClaim {
+  id            String   @id @default(cuid())
+  guestPlayerId String   @unique
+  userPlayerId  String
+  xpMerged      Int      @default(0)
+  coinsMerged   Int      @default(0)
+  runsMerged    Int      @default(0)
+  claimedAt     DateTime @default(now())
+
+  guestPlayer Player @relation("ClaimGuestSide", fields: [guestPlayerId], references: [id], onDelete: Cascade)
+  userPlayer  Player @relation("ClaimUserSide", fields: [userPlayerId], references: [id], onDelete: Cascade)
+
+  @@index([userPlayerId])
+}
+
+// ============================================================
+// Game registry
+// ============================================================
+
+/// One row per game (songless, framed, …). Engine shape lives here so a new
+/// game is configuration, not a fork of the run loop.
+model Game {
+  id       String  @id @default(cuid())
+  slug     String  @unique
+  name     String
+  tagline  String?
+  isActive Boolean @default(false)
+
+  /// Attempts per puzzle. Fixed — difficulty comes from the catalog.
+  maxAttempts Int @default(6)
+  livesPerRun Int @default(3)
+  /// Rounds in a daily run. Default matches the 10-song design.
+  dailyRounds Int @default(10)
+
+  /// Cumulative reveal ladder in ms: [200, 700, 1200, 2200, 4000, 7000].
+  /// Length must equal maxAttempts. Validated at ingest, not by the DB.
+  revealLadder Json
+  /// Bump whenever revealLadder changes. PuzzleAsset.stageByteOffsets carries the
+  /// revision it was cut against, so a mismatch is a detectable "recompute me"
+  /// rather than silently serving clips of the wrong length.
+  ladderRevision Int @default(1)
+
+  /// The difficulty curve, as data. Round 1 targets startPopularity; each later
+  /// round subtracts rampPerRound, floored at minPopularity so a deep run can't
+  /// fall off the edge of the catalog. Sampling picks anywhere within
+  /// ±sampleWindow of that target.
+  startPopularity Int   @default(90)
+  rampPerRound    Float @default(3.5)
+  minPopularity   Int   @default(20)
+  sampleWindow    Int   @default(5)
+
+  /// Pins which scoring implementation new runs use.
+  scoringVersion Int @default(1)
+
+  /// Rounds without a repeat for the same player.
+  puzzleCooldownDays Int @default(45)
+
+  config Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  puzzles            Puzzle[]
+  runs               Run[]
+  dailyChallenges    DailyChallenge[]
+  playerStats        PlayerGameStat[]
+  leaderboardEntries LeaderboardEntry[]
+  multiplayerRooms   MultiplayerRoom[]
+}
+
+// ============================================================
+// Content
+// ============================================================
+
+/// The universal unit of "one thing to guess". Holds everything the scheduler
+/// and difficulty tuner need; game-specific data hangs off a 1:1 detail table.
+model Puzzle {
+  id     String @id @default(cuid())
+  gameId String
+
+  /// 0-100. Seeded from an external signal, then corrected by telemetry.
+  popularity     Int
+  /// The original external signal, kept so retuning is auditable/reversible.
+  seedPopularity Int
+
+  playCount       Int    @default(0)
+  solveCount      Int    @default(0)
+  /// Solved within the first 3 stages — the signal that drives retuning.
+  earlySolveCount Int    @default(0)
+  solveRate       Float?
+  retunedAt       DateTime?
+
+  isActive Boolean @default(true)
+  /// Set false to pull a puzzle without deleting history.
+  isBlocked Boolean @default(false)
+
+  /// Provenance — day-one columns so per-track purge or proof is possible later.
+  licenseSource String?
+  ingestSource  String?
+  ingestRef     String?
+  ingestedAt    DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  game              Game                   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  song              Song?
+  assets            PuzzleAsset[]
+  rounds            RunRound[]
+  playerHistory     PlayerPuzzleHistory[]
+  dailyAppearance   DailyChallengePuzzle[]
+  multiplayerRounds MultiplayerRound[]
+
+  /// The sampling index: active puzzles for a game ordered by popularity.
+  @@index([gameId, isActive, isBlocked, popularity])
+  @@unique([gameId, ingestSource, ingestRef])
+}
+
+enum AssetKind {
+  AUDIO_CLIP
+  IMAGE
+  VIDEO_CLIP
+  TEXT_SNIPPET
+}
+
+/// ONE row per puzzle per asset kind. For songless that means a single
+/// AUDIO_CLIP holding a 30s cut from Song.hookStartMs, plus an IMAGE for the
+/// post-resolve artwork.
+///
+/// The clip is deliberately LONGER than the reveal ladder can unlock
+/// (max(Game.revealLadder), 15s today). The surplus is a backup tail: it makes
+/// the ladder a real data tunable up to 30s — `npm run reslice` recomputes
+/// offsets over bytes already in the bucket, no masters and no re-upload — and
+/// the ?reveal=1 playback hands the whole 30s to the result panel. Nothing in
+/// play can reach past the last rung.
+///
+/// There is no per-stage row and no per-stage upload: the ladder is served by
+/// byte-range slicing this one file (see stageByteOffsets). Stage N is a prefix
+/// of the same object, which is why a prefix has to be independently decodable —
+/// store CBR MP3, not AAC-in-MP4, or a truncated response won't play.
+///
+/// storageKey is private and MUST be content-addressed (use checksum), never
+/// derived from title/artist — a signed URL is visible to the client, so a
+/// human-readable key hands over the answer.
+model PuzzleAsset {
+  id       String @id @default(cuid())
+  puzzleId String
+
+  kind       AssetKind
+  storageKey String
+  mimeType   String?
+  /// Full length of the stored clip, backup tail included — NOT max(revealLadder).
+  /// For AUDIO_CLIP this is the 30s window, or less where the master ran out past
+  /// hookStartMs. It is what ?reveal=1 plays, so it is the duration a player can
+  /// actually hear.
+  durationMs Int?
+  /// Byte length of the stored object, and the exclusive end ?reveal=1 serves.
+  byteSize   Int?
+  checksum   String?
+
+  /// AUDIO_CLIP only. Frame-aligned exclusive end offset per reveal stage,
+  /// computed at ingest against Game.revealLadder. Serving stage N is
+  /// `bytes=0-(stageByteOffsets[N-1] - 1)`.
+  /// Precomputed rather than derived at request time because CBR MP3 frames
+  /// alternate size via the padding bit, so ms→byte math is not exact.
+  ///
+  /// The last entry is the end of the PLAYABLE window and is strictly LESS than
+  /// byteSize — everything between the two is the backup tail. (It equalled
+  /// byteSize before the 30s window landed; code asserting that is stale.)
+  stageByteOffsets Int[]
+  /// Which Game.ladderRevision these offsets were cut against. If it drifts from
+  /// the game's current value the offsets are stale and must be recomputed —
+  /// a frame-header scan, no re-encode and no re-upload.
+  ladderRevision   Int   @default(1)
+
+  puzzle Puzzle @relation(fields: [puzzleId], references: [id], onDelete: Cascade)
+
+  /// One asset per kind. A future game needing multiple images per puzzle
+  /// (blurred frames) reintroduces a discriminator here; audio never will.
+  @@unique([puzzleId, kind])
+}
+
+/// Songless detail table. 1:1 with Puzzle — puzzleId IS the primary key.
+/// A second game adds its own table here and touches nothing else.
+model Song {
+  puzzleId String @id
+
+  title  String
+  artist String
+  album  String?
+  /// The film this track is from, when it is from one at all. Null for a
+  /// single or a non-film album — most of the catalog outside Bollywood.
+  ///
+  /// Separate from `album` on purpose. `album` is the literal store
+  /// collection ("Saiyaara (Original Motion Picture Soundtrack)"), which for
+  /// a film track is the film plus noise and for an indie single is not a
+  /// film at all — so it can neither be shown as a film name nor filtered on.
+  /// This holds the bare film title, and only when something actually
+  /// identified the track as a film track.
+  ///
+  /// Deliberately NOT part of searchText: the typeahead matches what a player
+  /// is guessing, and letting a film name surface its songs would hand over
+  /// answers.
+  movie  String?
+
+  releaseYear Int?
+  decade      Int?
+  genres      String[]
+
+  durationMs Int?
+  /// Where the reveal ladder starts. 0 = track start; set past the intro so
+  /// stage 1 lands on the hook rather than silence.
+  hookStartMs Int  @default(0)
+
+  isrc       String?
+  externalId String?
+
+  /// Columns from an abandoned preview-audio feature. Never wired into any
+  /// route or script — kept here only so schema.prisma matches the live
+  /// database instead of silently diverging from it.
+  previewAudioKey      String?
+  previewAudioMimeType String?
+
+  /// Accepted alternate titles, for the typeahead index.
+  aliases    String[]
+  /// Normalized title+artist for trigram search. Populated at ingest.
+  searchText String?
+
+  puzzle Puzzle @relation(fields: [puzzleId], references: [id], onDelete: Cascade)
+
+  @@index([artist])
+  /// Backs the era filter in puzzle selection (src/lib/game/selection.ts).
+  @@index([decade])
+  /// Trigram GIN, not btree — the typeahead matches on substrings and
+  /// similarity, which a btree can't serve. Declared here rather than left to a
+  /// raw migration so Prisma keeps managing it; the pg_trgm extension it depends
+  /// on IS raw (see 20260821010000_song_searchtext_trigram).
+  @@index([searchText(ops: raw("gin_trgm_ops"))], type: Gin)
+}
+
+// ============================================================
+// Daily challenge
+// ============================================================
+
+/// Precomputed and frozen: every player gets the identical ordered set for the
+/// day. Storing the list explicitly (rather than deriving from the seed at read
+/// time) means later catalog changes can never shift a published day.
+model DailyChallenge {
+  id     String @id @default(cuid())
+  gameId String
+
+  /// Calendar day in the platform's fixed daily timezone. "2026-08-19".
+  dayKey String
+  seed   String
+  /// Frozen copy of Game.dailyRounds — 10 today, and retuning it later must not
+  /// change how many rounds an already-published day has.
+  roundCount Int
+
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  game    Game                   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  entries DailyChallengePuzzle[]
+  runs    Run[]
+
+  @@unique([gameId, dayKey])
+}
+
+model DailyChallengePuzzle {
+  dailyChallengeId String
+  roundIndex       Int
+  puzzleId         String
+  targetPopularity Int?
+
+  dailyChallenge DailyChallenge @relation(fields: [dailyChallengeId], references: [id], onDelete: Cascade)
+  puzzle         Puzzle         @relation(fields: [puzzleId], references: [id])
+
+  @@id([dailyChallengeId, roundIndex])
+  @@unique([dailyChallengeId, puzzleId])
+}
+
+// ============================================================
+// Runs — the state machine
+// ============================================================
+
+enum RunMode {
+  /// Once per day, fixed set, ranked, no restarts.
+  DAILY
+  /// Unlimited, random songs, unranked. XP only.
+  PRACTICE
+  /// Unlimited, random songs, lives, ranked. Ships after v1.
+  ENDLESS
+  /// Shared room session: up to 5 players on the same puzzles.
+  MULTIPLAYER
+}
+
+enum RunStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+  EXPIRED
+}
+
+/// Player-chosen era filter, narrowing which Song.decade a run samples from.
+/// Null on Run means no filter (all eras).
+enum RunEra {
+  /// Song.decade 1960-1990 (release years 1960-1999).
+  NINETIES
+  /// Song.decade 2000 and up.
+  TWO_THOUSANDS
+}
+
+model Run {
+  id       String @id @default(cuid())
+  gameId   String
+  playerId String
+
+  mode RunMode
+
+  /// Set ONLY for DAILY. Postgres treats NULLs as distinct in unique indexes,
+  /// so the composite unique below enforces one daily per player per day while
+  /// leaving practice/endless runs unlimited. No partial index needed.
+  dayKey           String?
+  dailyChallengeId String?
+  multiplayerRoomId String?
+
+  /// Drives puzzle selection for PRACTICE/ENDLESS; copied from the challenge
+  /// for DAILY. Persisted so a run is always reproducible.
+  seed String
+
+  /// Player-chosen era category. Null = all eras. Persisted (rather than
+  /// re-sent per request) because samplePuzzle() runs again server-side on
+  /// every round advance (see applyAttempt in src/lib/game/attempt.ts), not
+  /// just at run start.
+  decadeFilter RunEra?
+
+  status RunStatus @default(IN_PROGRESS)
+
+  /// Server-owned cursor. The client never tells us which round it's on.
+  currentRoundIndex Int  @default(1)
+  livesRemaining    Int
+  /// Null = unbounded (practice/endless).
+  maxRounds         Int?
+
+  score        Int @default(0)
+  xpEarned     Int @default(0)
+  roundsSolved Int @default(0)
+  roundsFailed Int @default(0)
+  /// Consecutive solves, at any stage — the in-run streak multiplier input.
+  currentStreak Int @default(0)
+  bestStreak    Int @default(0)
+  /// Total audio unlocked across the run, in ms. Leaderboard tie-break.
+  totalRevealMs Int @default(0)
+
+  /// Pinned at creation so a mid-season rebalance never rewrites history.
+  scoringVersion Int
+  isRanked       Boolean @default(false)
+
+  /// SHA-256 of the run token handed to the client. Every mutation must present
+  /// the raw token; we never store it.
+  tokenHash String
+  /// Optimistic concurrency guard against double-submitted attempts.
+  version   Int    @default(0)
+
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+  /// Abandoned runs get swept to EXPIRED so boards aren't held open.
+  expiresAt DateTime
+
+  clientIpHash  String?
+  userAgentHash String?
+
+  game            Game                   @relation(fields: [gameId], references: [id])
+  player          Player                 @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  dailyChallenge  DailyChallenge?        @relation(fields: [dailyChallengeId], references: [id])
+  multiplayerRoom MultiplayerRoom?       @relation("RoomRuns", fields: [multiplayerRoomId], references: [id])
+  multiplayerPlayer MultiplayerRoomPlayer?
+  rounds          RunRound[]
+  hints           HintUsage[]
+  ledger          LedgerEntry[]
+
+  /// One daily per player/game/day. Practice + endless unaffected (NULL).
+  @@unique([playerId, gameId, dayKey])
+  @@index([gameId, mode, status])
+  @@index([playerId, startedAt])
+  @@index([status, expiresAt])
+  /// Board reads: top ranked scores for a game.
+  @@index([gameId, isRanked, score])
+}
+
+enum RoundOutcome {
+  PENDING
+  SOLVED
+  FAILED
+}
+
+model RunRound {
+  id         String @id @default(cuid())
+  runId      String
+  roundIndex Int
+  puzzleId   String
+
+  outcome RoundOutcome @default(PENDING)
+  /// Highest unlocked stage, 1..maxAttempts. This is the server's source of
+  /// truth for which asset the client is allowed to fetch.
+  stageReached Int      @default(1)
+  attemptsUsed Int      @default(0)
+
+  points Int @default(0)
+  xp     Int @default(0)
+
+  /// What the ramp asked for vs what got sampled — lets you debug the
+  /// difficulty curve after the fact without replaying the run.
+  targetPopularity Int?
+  puzzlePopularity Int?
+
+  startedAt       DateTime  @default(now())
+  resolvedAt      DateTime?
+  solveDurationMs Int?
+
+  run     Run         @relation(fields: [runId], references: [id], onDelete: Cascade)
+  puzzle  Puzzle      @relation(fields: [puzzleId], references: [id])
+  guesses Guess[]
+  hints   HintUsage[]
+
+  @@unique([runId, roundIndex])
+  /// A puzzle appears at most once per run.
+  @@unique([runId, puzzleId])
+  @@index([puzzleId, outcome])
+}
+
+/// Skips are recorded as guesses with isSkip = true, so attemptIndex stays a
+/// single dense sequence and the ladder can't be advanced twice for one attempt.
+model Guess {
+  id      String @id @default(cuid())
+  roundId String
+
+  /// 1..maxAttempts.
+  attemptIndex Int
+  stageAtGuess Int
+
+  /// Typeahead selection. Free-text raw input is kept only for tuning aliases.
+  guessedPuzzleId String?
+  rawInput        String?
+
+  isCorrect Boolean @default(false)
+  isSkip    Boolean @default(false)
+
+  /// Client-generated, globally unique. Makes a retried request a no-op
+  /// instead of a free extra attempt.
+  idempotencyKey String @unique
+
+  createdAt DateTime @default(now())
+
+  round RunRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+
+  /// The hard invariant: one row per attempt slot. A replayed attempt collides.
+  @@unique([roundId, attemptIndex])
+}
+
+// ============================================================
+// Rewards (schema now, wired up post-v1)
+// ============================================================
+
+/// Hints add SIDE INFORMATION only. None of them extend the reveal ladder or
+/// grant extra attempts — every player's ladder stays identical.
+enum HintType {
+  DECADE
+  GENRE
+  FIRST_LETTER
+  ARTIST
+  FIFTY_FIFTY
+  /// Run-scoped, not round-scoped.
+  EXTRA_LIFE
+}
+
+model HintUsage {
+  id      String  @id @default(cuid())
+  runId   String
+  roundId String?
+
+  type     HintType
+  coinCost Int
+  /// What was actually revealed, for replay/support.
+  payload  Json?
+
+  createdAt DateTime @default(now())
+
+  run   Run       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  round RunRound? @relation(fields: [roundId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+}
+
+enum LedgerKind {
+  XP_EARNED
+  COIN_EARNED
+  COIN_SPENT
+  GUEST_MERGE
+  ADJUSTMENT
+}
+
+/// Append-only. Player.xp / .coins are caches of this; the ledger is what makes
+/// the guest merge auditable and balance disputes answerable.
+model LedgerEntry {
+  id       String @id @default(cuid())
+  playerId String
+
+  kind      LedgerKind
+  xpDelta   Int        @default(0)
+  coinDelta Int        @default(0)
+
+  runId  String?
+  reason String?
+  meta   Json?
+
+  createdAt DateTime @default(now())
+
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  run    Run?   @relation(fields: [runId], references: [id], onDelete: SetNull)
+
+  @@index([playerId, createdAt])
+}
+
+// ============================================================
+// Stats & leaderboards
+// ============================================================
+
+/// Rollup so profile and streak reads never scan the run table. One row per
+/// player per game.
+model PlayerGameStat {
+  id       String @id @default(cuid())
+  playerId String
+  gameId   String
+
+  runsPlayed   Int @default(0)
+  roundsPlayed Int @default(0)
+  roundsSolved Int @default(0)
+
+  bestRunScore   Int @default(0)
+  bestDailyScore Int @default(0)
+  bestRoundStreak Int @default(0)
+
+  /// Daily-challenge streak, distinct from the in-run solve streak.
+  currentDailyStreak Int     @default(0)
+  longestDailyStreak Int     @default(0)
+  lastPlayedDayKey   String?
+  streakFreezesLeft  Int     @default(1)
+
+  xp Int @default(0)
+
+  multiplayerRunsPlayed Int @default(0)
+  multiplayerWins       Int @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  game   Game   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@unique([playerId, gameId])
+  @@index([gameId, bestRunScore])
+}
+
+/// Prevents repeats across runs. Rows expire per Game.puzzleCooldownDays.
+model PlayerPuzzleHistory {
+  playerId String
+  puzzleId String
+
+  seenCount   Int           @default(1)
+  lastOutcome RoundOutcome?
+  lastSeenAt  DateTime      @default(now())
+
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  puzzle Puzzle @relation(fields: [puzzleId], references: [id], onDelete: Cascade)
+
+  @@id([playerId, puzzleId])
+  @@index([playerId, lastSeenAt])
+}
+
+enum BoardType {
+  /// One day of the daily challenge.
+  DAILY
+  WEEKLY_BEST_RUN
+  ALLTIME_BEST_RUN
+  ALLTIME_XP
+  DAILY_STREAK
+}
+
+/// Denormalized board rows, upserted when a run finishes. periodKey carries the
+/// window: "2026-08-19" | "2026-W34" | "ALL". One table serves every board on
+/// every game, so a new game needs no new query path.
+model LeaderboardEntry {
+  id        String    @id @default(cuid())
+  gameId    String
+  boardType BoardType
+  periodKey String
+
+  playerId String
+  score    Int
+  /// Lower is better. Total audio unlocked (ms) — the primary tie-break.
+  tieBreakRevealMs Int?
+  /// Lower is better. Wall-clock ms — the secondary tie-break.
+  tieBreakDurationMs Int?
+
+  runId String?
+  /// Materialized on read for display; recomputed, never trusted as truth.
+  rank  Int?
+
+  updatedAt DateTime @updatedAt
+
+  game   Game   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  /// A player holds exactly one row per board per period.
+  @@unique([gameId, boardType, periodKey, playerId])
+  /// The board read: ORDER BY score DESC, tieBreakRevealMs ASC.
+  @@index([gameId, boardType, periodKey, score])
+}
+
+// ============================================================
+// Multiplayer
+// ============================================================
+
+enum RoomStatus {
+  WAITING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum RoomPlayerStatus {
+  WAITING
+  READY
+  PLAYING
+  DISCONNECTED
+  LEFT
+}
+
+/// A shared game session where 2-5 players compete on the same puzzles.
+model MultiplayerRoom {
+  id           String     @id @default(cuid())
+  /// 6-char alphanumeric code for sharing. e.g. "ABC123"
+  code         String     @unique @db.Char(6)
+  gameId       String
+  hostPlayerId String
+  status       RoomStatus @default(WAITING)
+  maxPlayers   Int        @default(5)
+  totalRounds  Int        @default(5)
+  currentRound Int        @default(0)
+  seed         String
+  createdAt    DateTime   @default(now())
+  startsAt     DateTime?
+  completedAt  DateTime?
+  expiresAt    DateTime
+
+  game    Game                    @relation(fields: [gameId], references: [id])
+  host    Player                  @relation("RoomHost", fields: [hostPlayerId], references: [id])
+  players MultiplayerRoomPlayer[]
+  rounds  MultiplayerRound[]
+  runs    Run[]                   @relation("RoomRuns")
+
+  @@index([status, expiresAt])
+}
+
+/// One row per player in a room.
+model MultiplayerRoomPlayer {
+  id            String           @id @default(cuid())
+  roomId        String
+  playerId      String
+  status        RoomPlayerStatus @default(WAITING)
+  seatIndex     Int
+  runId         String?          @unique
+  score         Int              @default(0)
+  roundsSolved  Int              @default(0)
+  totalRevealMs Int              @default(0)
+  isWinner      Boolean          @default(false)
+  joinedAt      DateTime         @default(now())
+  finishedAt    DateTime?
+
+  room   MultiplayerRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  player Player          @relation(fields: [playerId], references: [id])
+  run    Run?            @relation(fields: [runId], references: [id])
+
+  @@unique([roomId, playerId])
+  @@unique([roomId, seatIndex])
+}
+
+/// Pre-selected puzzle for each round in a multiplayer room. All players get the same puzzle per round.
+model MultiplayerRound {
+  id         String @id @default(cuid())
+  roomId     String
+  roundIndex Int
+  puzzleId   String
+
+  room   MultiplayerRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  puzzle Puzzle          @relation(fields: [puzzleId], references: [id])
+
+  @@unique([roomId, roundIndex])
+}
