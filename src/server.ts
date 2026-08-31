@@ -20,15 +20,52 @@ const httpServer = createServer((_req, res) => {
 // but stops cookies/credentials from ever being usable here — fine today,
 // since auth is proven via the run token / playerId in the socket payload,
 // not a cookie.
-const corsOrigin = process.env.CORS_ORIGIN?.split(',').map((o) => o.trim()) ?? '*'
+//
+// Entries may use `*` as a wildcard for one hostname label, so
+// `https://*.vercel.app` covers Vercel's preview deployments — their hostnames
+// carry a per-deployment hash and change on every single push, which no fixed
+// list can keep up with.
+//
+// Empty entries are dropped, and an empty list falls back to allowing any
+// origin. That matters: a blank dashboard value would otherwise split into
+// [''], an allowlist matching nothing, which rejects every client while
+// looking indistinguishable from a server that is simply down.
+const allowedOrigins = (process.env.CORS_ORIGIN ?? '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean)
+
+// Escape every regex metacharacter EXCEPT `*`, then expand `*` to "one label".
+const originPatterns = allowedOrigins.map(
+  (o) => new RegExp(`^${o.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^.]+')}$`),
+)
 
 const io = new SocketIOServer<ClientToServerEvents, ServerToClientEvents>(httpServer, {
   path: '/ws/socket.io',
-  cors: { origin: corsOrigin, methods: ['GET', 'POST'] },
+  cors: {
+    origin:
+      originPatterns.length === 0
+        ? '*'
+        : (origin, callback) => {
+            // curl, health checks and same-origin requests send no Origin at
+            // all; there is no browser to protect, so let them through.
+            if (!origin) return callback(null, true)
+            callback(null, originPatterns.some((re) => re.test(origin)))
+          },
+    methods: ['GET', 'POST'],
+  },
 })
 
 registerSocketHandlers(io)
 
 httpServer.listen(port, () => {
   console.log(`> sargam-realtime-server ready on :${port}`)
+  // Printed every boot on purpose: a CORS rejection is invisible from the
+  // client side (the browser reports only "no Access-Control-Allow-Origin"),
+  // so the allowlist the server ACTUALLY parsed belongs in the logs.
+  console.log(
+    originPatterns.length === 0
+      ? '> CORS: allowing any origin (CORS_ORIGIN unset or empty)'
+      : `> CORS: allowing ${allowedOrigins.map((o) => `"${o}"`).join(', ')}`,
+  )
 })
