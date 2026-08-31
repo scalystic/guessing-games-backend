@@ -1,7 +1,7 @@
 # sargam-realtime-server
 
 Standalone Socket.IO server for SARGAM's multiplayer rooms. Deployed
-separately (Railway) from the main Next.js app (Vercel) because Vercel's
+separately (Render) from the main Next.js app (Vercel) because Vercel's
 serverless functions can't host a persistent WebSocket server. This process
 does one thing: hold open socket connections and drive multiplayer rooms —
 lobby state, live scoring, chat, round advancement.
@@ -36,17 +36,40 @@ npm run dev             # tsx watch src/server.ts, listens on :4000
 Point the main app's `NEXT_PUBLIC_SOCKET_URL` at `http://localhost:4000` to
 test the two together locally.
 
-## Deploying (Railway)
+## Deploying (Render)
 
-1. Push this repo to its own GitHub repo, connect it in Railway.
-2. Set env vars in Railway's dashboard: `DATABASE_URL` (same value as the main
-   app), `APP_BASE_URL` (the main app's live Vercel URL), `CORS_ORIGIN`
-   (the main app's origin — comma-separated if more than one).
-3. Railway builds via `npm run build` (just `prisma generate` — there's no
-   app code to bundle) and starts via `npm start`.
-4. Take the URL Railway gives this service and set it as
-   `NEXT_PUBLIC_SOCKET_URL` in the main app's Vercel project settings, then
-   redeploy the main app.
+`render.yaml` in this repo is a Render Blueprint — it carries the build/start
+commands, health check, region and instance count, so the dashboard only has
+to ask for the three secrets.
+
+1. Render → **New → Blueprint**, point it at this repo. It reads `render.yaml`
+   and prompts for the three `sync: false` vars: `DATABASE_URL` (verbatim copy
+   of the main app's), `APP_BASE_URL` (the main app's live Vercel URL, no
+   trailing slash), `CORS_ORIGIN` (the main app's origin — comma-separated if
+   more than one).
+2. Render builds via `npm install --include=dev && npm run build`
+   (`prisma generate` — there's no app code to bundle) and starts via
+   `npm start`. The `--include=dev` matters: Render sets `NODE_ENV=production`,
+   and both `prisma` and `tsx` are devDependencies.
+3. Take the `https://<service>.onrender.com` URL Render gives this service and
+   set it as `NEXT_PUBLIC_SOCKET_URL` in the main app's Vercel project
+   settings, then redeploy the main app. WebSocket upgrade to `wss://` is
+   automatic; the custom `/ws/socket.io` path passes through unchanged.
+
+### On the free plan
+
+Free instances spin down after 15 minutes without an inbound request, and cold
+start takes ~50s — which a player waiting to join a room will feel. Keep it
+awake with an external cron (cron-job.org, or a scheduled GitHub Action)
+hitting `https://<service>.onrender.com/` every 10 minutes; the root route
+already returns 200 for exactly this reason. 750 free instance-hours/month
+covers one always-on service (~720h), but they're shared across every free
+service in the account.
+
+Don't rely on open sockets to keep it alive — spin-down watches inbound
+requests, and a long-lived WebSocket may not count.
+
+Deploys and restarts drop live rooms, since room state is an in-process Map.
 
 ## Keeping the schema in sync
 

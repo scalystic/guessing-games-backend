@@ -2,7 +2,7 @@
   "name": "sargam-realtime-server",
   "version": "0.1.0",
   "private": true,
-  "description": "Standalone Socket.IO server for SARGAM multiplayer — deployed separately (Railway) from the main Next.js app (Vercel), sharing the same Postgres database.",
+  "description": "Standalone Socket.IO server for SARGAM multiplayer — deployed separately (Render) from the main Next.js app (Vercel), sharing the same Postgres database.",
   "engines": {
     "node": ">=22"
   },

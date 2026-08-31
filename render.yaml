@@ -1,0 +1,45 @@
+# Render Blueprint. Create the service via Render → New → Blueprint and point
+# it at this repo, instead of filling the settings in by hand.
+#
+# The three `sync: false` vars are deliberately not stored here — Render will
+# prompt for them when the blueprint is applied. DATABASE_URL in particular is
+# a secret and must never live in the repo.
+services:
+  - type: web
+    name: guessing-games-backend
+    runtime: node
+    plan: free
+    # Match the region to wherever Neon hosts the database (ap-southeast-1 →
+    # singapore) — every socket event does a round trip to Postgres.
+    region: singapore
+    branch: main
+
+    # --include=dev is load-bearing: Render sets NODE_ENV=production, and both
+    # the build (prisma) and the start command (tsx) live in devDependencies.
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+
+    # src/generated is gitignored, so the Prisma client only exists after the
+    # build step runs `prisma generate`.
+    healthCheckPath: /
+
+    # The room state in src/socket-handler.ts is an in-process Map with
+    # setTimeout round timers. A second instance would put players in the same
+    # room on different servers with no shared state — keep this at 1 until
+    # there is a Redis adapter.
+    numInstances: 1
+
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Same Postgres the Next.js app uses — copy the value verbatim.
+      - key: DATABASE_URL
+        sync: false
+      # The Vercel app's public URL, no trailing slash. Used for the
+      # force-give-up callback into /api/runs/:id/giveup.
+      - key: APP_BASE_URL
+        sync: false
+      # Comma-separated allowed socket origins — the Vercel domain, plus
+      # http://localhost:3000 if you run the main app against this server.
+      - key: CORS_ORIGIN
+        sync: false
