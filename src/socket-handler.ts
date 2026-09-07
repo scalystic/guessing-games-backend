@@ -22,11 +22,20 @@ const APP_BASE_URL = (() => {
   return url.replace(/\/$/, '')
 })()
 
+/// Bounded, because this call sits directly between a round's deadline firing
+/// and the room seeing its reveal. An unbounded fetch to another deployment
+/// (cold function, network stall) would hold every player on "waiting for
+/// other players" for as long as it took to give up on its own. On a timeout
+/// the round resolves anyway: the straggler's RunRound stays PENDING, which
+/// resolveRoundInner already reports as FAILED for the reveal.
+const GIVEUP_TIMEOUT_MS = 8_000
+
 async function forceGiveUp(runId: string, runToken: string, idempotencyKey: string): Promise<void> {
   await fetch(`${APP_BASE_URL}/api/runs/${runId}/giveup`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${runToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ idempotencyKey }),
+    signal: AbortSignal.timeout(GIVEUP_TIMEOUT_MS),
   })
 }
 
@@ -46,15 +55,42 @@ type RoomMemory = {
   /// Guards a round from being resolved twice — the timeout above and the
   /// normal "everyone's done" path can both try, and only one may win.
   resolvedRounds: Set<number>
+  /// When the current round's budget runs out, as epoch ms. Held here (not just
+  /// in the timer) so a client reconnecting mid-round gets the SAME deadline
+  /// everyone else is counting down to, instead of a fresh full window.
+  roundDeadlineMs: number | null
 }
 
 const rooms = new Map<string, RoomMemory>()
 
-/// Generous upper bound on how long one round is allowed to stay open. The
-/// client's own auto-skip timer walks the reveal ladder well inside this
-/// window under normal conditions — this is purely a backstop so a stalled or
-/// disconnected player can never freeze the room for everyone else.
-const ROUND_TIMEOUT_MS = 90_000
+/// Hard cap on how long one round may stay open when NOBODY has finished it.
+/// The reveal ladder is 31.9s of audio across all six stages, so this is a
+/// generous double of the time it takes to actually hear every clip.
+///
+/// It used to be 90s, and used to be described as a mere backstop — "the
+/// client's own auto-skip timer walks the ladder well inside this window". That
+/// auto-skip is gone (nothing on the client forces a stage forward any more;
+/// see LiveMultiplayerRound), which quietly promoted this timeout from backstop
+/// to the PRIMARY way a round with an idle player ends. At 90s that meant
+/// everyone who had already guessed sat on "waiting for other players" for over
+/// a minute — the single worst wait in the game.
+const ROUND_TIMEOUT_MS = 60_000
+
+/// Once the first player resolves the round, everyone else gets at most this
+/// long to finish before the room moves on (see applyGraceDeadline).
+///
+/// This, not the cap above, is what actually bounds the wait in a real game:
+/// nobody is cut short until someone has genuinely solved or busted, and from
+/// that moment the round is guaranteed to wrap inside 15s instead of running
+/// out the full window on one idle tab.
+const FIRST_FINISH_GRACE_MS = 15_000
+
+/// How long the reveal panel stays up between a round resolving and the next
+/// one starting. Sent to clients as `nextRoundAt` so their countdown is the
+/// server's real schedule rather than a duplicated constant that can drift.
+/// Long enough to read the song and the scoreline, short enough that ten rounds
+/// don't add a minute of staring at a panel nobody can interact with.
+const RESULTS_DELAY_MS = 3_500
 
 function clearRoundTimer(mem: RoomMemory): void {
   if (mem.roundTimer) {
@@ -69,25 +105,45 @@ function mintToken(): { token: string; tokenHash: string } {
   return { token, tokenHash }
 }
 
+/// Pick the room's whole puzzle set up front — every player plays the same
+/// songs in the same order, which is the only reason a room's scores compare.
+///
+/// YOUTUBE-ONLY: playability used to mean a stored R2 clip with at least one
+/// byte offset per attempt —
+///
+///   JOIN "PuzzleAsset" a ON a."puzzleId" = p.id AND a.kind = 'AUDIO_CLIP'
+///   AND coalesce(array_length(a."stageByteOffsets", 1), 0) >= maxAttempts
+///
+/// — and that is exactly why every room failed to start with "Not enough
+/// puzzles in the catalog": stored clips are retired, so the join matches
+/// nothing at all while the catalog is full of perfectly playable songs.
+///
+/// Playable now means what the solo sampler means by it (the main app's
+/// lib/game/selection.ts): the song streams from YouTube, and an admin has
+/// signed off on where its hook starts. Those two predicates have to stay in
+/// lockstep with selection.ts and api/games/[slug]/search — a room that draws a
+/// song the typeahead won't offer is a round nobody in it can guess.
+///
+/// `maxAttempts` is gone with the byte offsets: the stage ladder for a YouTube
+/// round is a play-window the client applies to the stream, not a set of
+/// offsets that has to exist up front.
 async function selectRoomPuzzles(
   gameId: string,
   totalRounds: number,
-  maxAttempts: number,
   decadeFilter: DecadeFilter | null,
 ): Promise<string[]> {
   type Row = { id: string }
   const rows = await prisma.$queryRaw<Row[]>`
     SELECT p.id
     FROM "Puzzle" p
-    JOIN "PuzzleAsset" a
-      ON a."puzzleId" = p.id
-     AND a.kind = 'AUDIO_CLIP'::"AssetKind"
-    LEFT JOIN "Song" s
+    -- INNER JOIN, not LEFT: no song row means no YouTube id means not playable.
+    JOIN "Song" s
       ON s."puzzleId" = p.id
     WHERE p."gameId" = ${gameId}
       AND p."isActive" = true
       AND p."isBlocked" = false
-      AND coalesce(array_length(a."stageByteOffsets", 1), 0) >= ${maxAttempts}
+      AND s."externalId" IS NOT NULL
+      AND s."isLocked" = true
       ${decadeClause(decadeFilter)}
     ORDER BY random()
     LIMIT ${totalRounds}
@@ -213,6 +269,7 @@ export function registerSocketHandlers(io: Server<ClientToServerEvents, ServerTo
             status: room.status as 'WAITING' | 'IN_PROGRESS' | 'COMPLETED',
             roundTimer: null,
             resolvedRounds: new Set(),
+            roundDeadlineMs: null,
           }
           rooms.set(code, mem)
         }
@@ -240,7 +297,16 @@ export function registerSocketHandlers(io: Server<ClientToServerEvents, ServerTo
           const creds = mem.playerRuns.get(myPlayerId)
           if (creds) {
             socket.emit('player:credentials', creds)
-            socket.emit('round:start', { roundIndex: room.currentRound, totalRounds: room.totalRounds })
+            socket.emit('round:start', {
+              roundIndex: room.currentRound,
+              totalRounds: room.totalRounds,
+              // The deadline the rest of the room is already counting down to,
+              // not a fresh window — reconnecting must not hand this player
+              // more time than everyone else has. Falls back to a full window
+              // only if this process has no memory of the round (it restarted
+              // mid-game), which is the same window its timer would use.
+              deadline: new Date(mem.roundDeadlineMs ?? Date.now() + ROUND_TIMEOUT_MS).toISOString(),
+            })
           }
         }
       } catch (e) {
@@ -288,9 +354,20 @@ export function registerSocketHandlers(io: Server<ClientToServerEvents, ServerTo
         if (room.status !== 'WAITING') return
         if (room.players.length < 1) { socket.emit('room:error', { message: 'Need at least 1 player' }); return }
 
-        const puzzleIds = await selectRoomPuzzles(room.gameId, room.totalRounds, room.game.maxAttempts, decadeFilter ?? null)
+        const puzzleIds = await selectRoomPuzzles(room.gameId, room.totalRounds, decadeFilter ?? null)
         if (puzzleIds.length < room.totalRounds) {
-          socket.emit('room:error', { message: 'Not enough puzzles in the catalog for this game' })
+          // The query is LIMIT totalRounds, so coming up short means this IS the
+          // real count — worth saying out loud. "Not enough puzzles" alone sent
+          // hosts looking at an empty catalog when the catalog was full and the
+          // filter (or the review queue) was the actual constraint.
+          const found = puzzleIds.length
+          const era = decadeFilter ? ' in the selected era' : ''
+          socket.emit('room:error', {
+            message:
+              `Only ${found} playable song${found === 1 ? '' : 's'}${era} — this room needs ${room.totalRounds}. ` +
+              (decadeFilter ? 'Try "All eras", or ' : 'Ask an admin to ') +
+              'review more songs so they can be played.',
+          })
           return
         }
 
@@ -314,52 +391,63 @@ export function registerSocketHandlers(io: Server<ClientToServerEvents, ServerTo
             status: 'WAITING',
             roundTimer: null,
             resolvedRounds: new Set(),
+            roundDeadlineMs: null,
           }
           rooms.set(code, mem)
         }
 
         const TTL_MS = 3 * 60 * 60 * 1000
 
-        for (const rp of room.players) {
-          const { token, tokenHash } = mintToken()
-          const run = await prisma.run.create({
-            data: {
-              gameId: room.gameId,
-              playerId: rp.playerId,
-              mode: 'MULTIPLAYER',
-              seed: room.seed,
-              status: 'IN_PROGRESS',
-              currentRoundIndex: 1,
-              livesRemaining: 99,
-              maxRounds: room.totalRounds,
-              scoringVersion: room.game.scoringVersion,
-              isRanked: false,
-              tokenHash,
-              expiresAt: new Date(Date.now() + TTL_MS),
-              multiplayerRoomId: room.id,
-            },
-          })
+        // Every player's run is built CONCURRENTLY, and each one's two
+        // follow-up writes go together. Serially this was three ~100ms round
+        // trips per player before the first note could play — a full room spent
+        // most of a second and a half staring at the lobby after pressing
+        // Start. Nothing here crosses players (separate runs, separate rows),
+        // and the two follow-ups only need the run id, not each other.
+        const startedMem = mem
+        await Promise.all(
+          room.players.map(async (rp) => {
+            const { token, tokenHash } = mintToken()
+            const run = await prisma.run.create({
+              data: {
+                gameId: room.gameId,
+                playerId: rp.playerId,
+                mode: 'MULTIPLAYER',
+                seed: room.seed,
+                status: 'IN_PROGRESS',
+                currentRoundIndex: 1,
+                livesRemaining: 99,
+                maxRounds: room.totalRounds,
+                scoringVersion: room.game.scoringVersion,
+                isRanked: false,
+                tokenHash,
+                expiresAt: new Date(Date.now() + TTL_MS),
+                multiplayerRoomId: room.id,
+              },
+            })
 
-          await prisma.runRound.create({
-            data: {
-              runId: run.id,
-              roundIndex: 1,
-              puzzleId: puzzleIds[0]!,
-            },
-          })
+            await Promise.all([
+              prisma.runRound.create({
+                data: {
+                  runId: run.id,
+                  roundIndex: 1,
+                  puzzleId: puzzleIds[0]!,
+                },
+              }),
+              prisma.multiplayerRoomPlayer.update({
+                where: { roomId_playerId: { roomId: room.id, playerId: rp.playerId } },
+                data: { runId: run.id, status: 'PLAYING' },
+              }),
+            ])
 
-          await prisma.multiplayerRoomPlayer.update({
-            where: { roomId_playerId: { roomId: room.id, playerId: rp.playerId } },
-            data: { runId: run.id, status: 'PLAYING' },
-          })
+            startedMem.playerRuns.set(rp.playerId, { runId: run.id, runToken: token })
 
-          mem.playerRuns.set(rp.playerId, { runId: run.id, runToken: token })
-
-          const playerSocketId = mem.playerSockets.get(rp.playerId)
-          if (playerSocketId) {
-            io.to(playerSocketId).emit('player:credentials', { runId: run.id, runToken: token })
-          }
-        }
+            const playerSocketId = startedMem.playerSockets.get(rp.playerId)
+            if (playerSocketId) {
+              io.to(playerSocketId).emit('player:credentials', { runId: run.id, runToken: token })
+            }
+          }),
+        )
 
         await prisma.multiplayerRoom.update({
           where: { id: room.id },
@@ -369,6 +457,10 @@ export function registerSocketHandlers(io: Server<ClientToServerEvents, ServerTo
         mem.status = 'IN_PROGRESS'
         mem.roundIndex = 1
         mem.roundDone.clear()
+        // A rematch reuses this same RoomMemory, and round 1 of the new game
+        // must not inherit the last game's "round 1 already resolved" claim —
+        // it would resolve instantly and skip straight past the round.
+        mem.resolvedRounds.clear()
 
         // Without this, every client's RoomInfo.currentRound stays whatever it
         // was during the lobby (the DB default, 0) — the header and
@@ -377,11 +469,76 @@ export function registerSocketHandlers(io: Server<ClientToServerEvents, ServerTo
         await broadcastRoomState(io, code)
 
         io.to(code).emit('game:started', { totalRounds: room.totalRounds, roundIndex: 1 })
-        io.to(code).emit('round:start', { roundIndex: 1, totalRounds: room.totalRounds })
-        scheduleRoundTimeout(io, code, room.id, 1, room.totalRounds, mem)
+        openRound(io, code, room.id, 1, room.totalRounds, mem)
       } catch (e) {
         console.error('[socket] room:start error', e)
         socket.emit('room:error', { message: 'Failed to start game' })
+      }
+    })
+
+    /// Host-only: put a COMPLETED room back in its lobby, with fresh puzzles and
+    /// every score reset. The clients already speak this (the "Done" button on
+    /// the game-over panel calls it); without a handler it was a dead button.
+    socket.on('room:rematch', async ({ code }) => {
+      const playerId = socket.data.playerId
+      if (!playerId) return
+      try {
+        const room = await prisma.multiplayerRoom.findUnique({
+          where: { code },
+          include: { players: true },
+        })
+        if (!room) return
+        if (room.hostPlayerId !== playerId) return
+        if (room.status !== 'COMPLETED') return
+
+        // The round set is keyed @@unique([roomId, roundIndex]), so the next
+        // room:start's createMany collides with the finished game's rows unless
+        // they go first. The Runs themselves are deliberately left alone: they
+        // are that game's record, and each player gets a brand-new one.
+        await prisma.multiplayerRound.deleteMany({ where: { roomId: room.id } })
+
+        await prisma.multiplayerRoomPlayer.updateMany({
+          where: { roomId: room.id },
+          data: {
+            score: 0,
+            roundsSolved: 0,
+            isWinner: false,
+            finishedAt: null,
+            runId: null,
+            status: 'WAITING',
+          },
+        })
+
+        await prisma.multiplayerRoom.update({
+          where: { id: room.id },
+          data: {
+            status: 'WAITING',
+            currentRound: 0,
+            startsAt: null,
+            completedAt: null,
+            seed: randomBytes(16).toString('hex'),
+            // The room was created with a 2h expiry; a rematch is a fresh sitting.
+            expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+          },
+        })
+
+        const mem = rooms.get(code)
+        if (mem) {
+          clearRoundTimer(mem)
+          mem.status = 'WAITING'
+          mem.roundIndex = 0
+          mem.roundDone.clear()
+          mem.resolvedRounds.clear()
+          mem.playerRuns.clear()
+          mem.roundDeadlineMs = null
+        }
+
+        // COMPLETED → WAITING is what tells every client this is a rematch
+        // rather than a ready-toggle, so their lobby opens on a clean chat.
+        await broadcastRoomState(io, code)
+      } catch (e) {
+        console.error('[socket] room:rematch error', e)
+        socket.emit('room:error', { message: 'Failed to restart the room' })
       }
     })
 
@@ -434,6 +591,11 @@ export function registerSocketHandlers(io: Server<ClientToServerEvents, ServerTo
 
       if (allDone) {
         await resolveRound(io, code, room.id, roundIndex, room.totalRounds, mem)
+      } else {
+        // Somebody has now finished, so the round is no longer allowed to run
+        // out its full window on whoever is left. Everyone still playing gets
+        // the short grace window instead.
+        applyGraceDeadline(io, code, room.id, roundIndex, room.totalRounds, mem)
       }
     })
 
@@ -571,12 +733,22 @@ async function resolveRoundInner(
   })
   if (!room) return
 
+  // One query for the whole room rather than one per player. Every statement
+  // here is ~100ms against the shared (remote) database, so a six-player room
+  // was spending over half a second of pure round trips assembling a panel it
+  // could have read in a single pass — see docs/performance.md in the main app:
+  // the unit to optimise is round trips per interaction, and this interaction
+  // is the one every player is sitting and waiting on.
+  const runIds = room.players.map((rp) => rp.runId).filter((id): id is string => id !== null)
+  const runRounds = await prisma.runRound.findMany({
+    where: { runId: { in: runIds }, roundIndex },
+  })
+  const runRoundByRunId = new Map(runRounds.map((rr) => [rr.runId, rr]))
+
   const playerResults = []
   for (const rp of room.players) {
     if (!rp.runId) continue
-    const runRound = await prisma.runRound.findUnique({
-      where: { runId_roundIndex: { runId: rp.runId, roundIndex } },
-    })
+    const runRound = runRoundByRunId.get(rp.runId)
     if (!runRound) continue
 
     playerResults.push({
@@ -603,6 +775,9 @@ async function resolveRoundInner(
       releaseYear: multiRound.puzzle.song.releaseYear ?? null,
     },
     playerResults,
+    // Derived from the very timer scheduled below, so the client's countdown
+    // can't disagree with when the next round actually opens.
+    nextRoundAt: new Date(Date.now() + RESULTS_DELAY_MS).toISOString(),
   })
 
   setTimeout(() => {
@@ -623,11 +798,10 @@ async function resolveRoundInner(
         // has to be pushed, not just the round:start signal to start playing.
         await broadcastRoomState(io, code)
 
-        io.to(code).emit('round:start', { roundIndex: nextRound, totalRounds })
-        scheduleRoundTimeout(io, code, roomId, nextRound, totalRounds, mem)
+        openRound(io, code, roomId, nextRound, totalRounds, mem)
       }
     })()
-  }, 5000)
+  }, RESULTS_DELAY_MS)
 }
 
 /// Force-completes any player who hasn't resolved this round yet by burning
@@ -635,28 +809,40 @@ async function resolveRoundInner(
 /// uses) — so a stalled or disconnected player can never leave the room
 /// waiting forever, and their own Run stays in lockstep with the room's round
 /// index instead of drifting behind it.
+/// Every player is handled CONCURRENTLY, not one after another. Each straggler
+/// costs a DB read, a cross-deployment HTTP POST to the main app's /giveup (a
+/// real network call — see APP_BASE_URL) and a scoring write, and this runs
+/// after the round is already over: serially, a room with several idle players
+/// added seconds of dead air between the deadline firing and anybody seeing the
+/// reveal. The per-player work is independent — different runs, different rows,
+/// and /giveup is idempotency-keyed — so there is nothing to serialise for.
 async function forceResolveStragglers(roomId: string, roundIndex: number, mem: RoomMemory): Promise<void> {
-  for (const [playerId, creds] of mem.playerRuns) {
-    try {
-      const runRound = await prisma.runRound.findUnique({
-        where: { runId_roundIndex: { runId: creds.runId, roundIndex } },
-      })
-      if (!runRound || runRound.outcome !== 'PENDING') continue
+  await Promise.all(
+    [...mem.playerRuns].map(async ([playerId, creds]) => {
+      try {
+        const runRound = await prisma.runRound.findUnique({
+          where: { runId_roundIndex: { runId: creds.runId, roundIndex } },
+        })
+        if (!runRound || runRound.outcome !== 'PENDING') return
 
-      await forceGiveUp(creds.runId, creds.runToken, `mp-timeout-${roomId}-${roundIndex}-${playerId}`)
-      await awardRoundScore(roomId, playerId, roundIndex)
-    } catch (e) {
-      console.error('[socket] forceResolveStragglers error', e)
-    }
-  }
+        await forceGiveUp(creds.runId, creds.runToken, `mp-timeout-${roomId}-${roundIndex}-${playerId}`)
+        await awardRoundScore(roomId, playerId, roundIndex)
+      } catch (e) {
+        console.error('[socket] forceResolveStragglers error', e)
+      }
+    }),
+  )
 }
 
-/// Schedules the round-timeout backstop (see ROUND_TIMEOUT_MS) — if the round
-/// hasn't resolved by itself in time, force it. resolveRound's own
-/// resolvedRounds guard makes this safe to race against the normal
-/// everyone's-done path; whichever gets there first wins and this becomes a
-/// no-op.
-function scheduleRoundTimeout(
+/// Opens a round: stamps its deadline, tells the room to play, and arms the
+/// backstop — one function so the `deadline` clients count down to and the
+/// timeout the server actually enforces are the same number by construction.
+///
+/// The backstop (see ROUND_TIMEOUT_MS) force-resolves a round that hasn't
+/// resolved by itself in time. resolveRound's own resolvedRounds guard makes
+/// that safe to race against the normal everyone's-done path; whichever gets
+/// there first wins and the other becomes a no-op.
+function openRound(
   io: Server,
   code: string,
   roomId: string,
@@ -665,9 +851,60 @@ function scheduleRoundTimeout(
   mem: RoomMemory,
 ): void {
   clearRoundTimer(mem)
+  const deadlineMs = Date.now() + ROUND_TIMEOUT_MS
+  mem.roundDeadlineMs = deadlineMs
+
+  io.to(code).emit('round:start', {
+    roundIndex,
+    totalRounds,
+    deadline: new Date(deadlineMs).toISOString(),
+  })
+
   mem.roundTimer = setTimeout(() => {
     void resolveRound(io, code, roomId, roundIndex, totalRounds, mem)
   }, ROUND_TIMEOUT_MS)
+}
+
+/// Pulls the open round's deadline in to the short grace window, and re-arms
+/// the timer on the new one. Called when a player finishes without ending the
+/// round, so the players still guessing are bounded by
+/// FIRST_FINISH_GRACE_MS rather than by whatever is left of the full window.
+///
+/// Only ever SHRINKS the deadline: if less than the grace window is already
+/// left, or a previous finisher has set the same grace, this is a no-op — which
+/// is also what makes it safe to call on every finisher rather than only the
+/// first, since the second one's grace lands later than the first's and is
+/// therefore rejected. That matters: a later finisher must not be able to hand
+/// the stragglers extra time by finishing.
+function applyGraceDeadline(
+  io: Server,
+  code: string,
+  roomId: string,
+  roundIndex: number,
+  totalRounds: number,
+  mem: RoomMemory,
+): void {
+  // No open deadline means no round to shorten (this process restarted
+  // mid-game, or the round already resolved between the emit and here).
+  if (mem.roundDeadlineMs === null) return
+  if (roundIndex !== mem.roundIndex) return
+  if (mem.resolvedRounds.has(roundIndex)) return
+
+  const graceDeadlineMs = Date.now() + FIRST_FINISH_GRACE_MS
+  if (graceDeadlineMs >= mem.roundDeadlineMs) return
+
+  clearRoundTimer(mem)
+  mem.roundDeadlineMs = graceDeadlineMs
+
+  io.to(code).emit('round:deadline', {
+    roundIndex,
+    deadline: new Date(graceDeadlineMs).toISOString(),
+    reason: 'grace',
+  })
+
+  mem.roundTimer = setTimeout(() => {
+    void resolveRound(io, code, roomId, roundIndex, totalRounds, mem)
+  }, FIRST_FINISH_GRACE_MS)
 }
 
 async function endGame(io: Server, code: string, roomId: string, mem: RoomMemory) {
@@ -689,28 +926,34 @@ async function endGame(io: Server, code: string, roomId: string, mem: RoomMemory
       data: { isWinner: true, finishedAt: new Date() },
     })
 
-    for (const rp of room.players) {
-      await prisma.playerGameStat.upsert({
-        where: { playerId_gameId: { playerId: rp.playerId, gameId: room.gameId } },
-        create: {
-          playerId: rp.playerId,
-          gameId: room.gameId,
-          multiplayerRunsPlayed: 1,
-          multiplayerWins: rp.playerId === winner.playerId ? 1 : 0,
-        },
-        update: {
-          multiplayerRunsPlayed: { increment: 1 },
-          multiplayerWins: rp.playerId === winner.playerId ? { increment: 1 } : undefined,
-        },
-      })
-
-      if (rp.runId) {
-        await prisma.run.update({
-          where: { id: rp.runId },
-          data: { status: 'COMPLETED', endedAt: new Date() },
-        }).catch(() => {})
-      }
-    }
+    // Concurrent for the same reason as room:start's run creation: two writes
+    // per player, all independent, and the whole room is waiting on them
+    // before `game:end` carries the final table.
+    await Promise.all(
+      room.players.flatMap((rp) => [
+        prisma.playerGameStat.upsert({
+          where: { playerId_gameId: { playerId: rp.playerId, gameId: room.gameId } },
+          create: {
+            playerId: rp.playerId,
+            gameId: room.gameId,
+            multiplayerRunsPlayed: 1,
+            multiplayerWins: rp.playerId === winner.playerId ? 1 : 0,
+          },
+          update: {
+            multiplayerRunsPlayed: { increment: 1 },
+            multiplayerWins: rp.playerId === winner.playerId ? { increment: 1 } : undefined,
+          },
+        }),
+        ...(rp.runId
+          ? [
+              prisma.run.update({
+                where: { id: rp.runId },
+                data: { status: 'COMPLETED', endedAt: new Date() },
+              }).catch(() => {}),
+            ]
+          : []),
+      ]),
+    )
   }
 
   await prisma.multiplayerRoom.update({
@@ -719,6 +962,8 @@ async function endGame(io: Server, code: string, roomId: string, mem: RoomMemory
   })
 
   mem.status = 'COMPLETED'
+  clearRoundTimer(mem)
+  mem.roundDeadlineMs = null
 
   const rankings = room.players.map((rp, i) => ({
     rank: i + 1,

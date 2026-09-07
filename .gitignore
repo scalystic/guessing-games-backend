@@ -1,5 +1,7 @@
 /node_modules
 /src/generated
+# yt-dlp binary, downloaded at build time by scripts/install-yt-dlp.mjs.
+/bin
 .env
 .env.local
 *.log

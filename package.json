@@ -8,11 +8,14 @@
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "prisma generate",
+    "build": "prisma generate && npm run install:yt-dlp",
     "start": "tsx src/server.ts",
-    "db:generate": "prisma generate"
+    "db:generate": "prisma generate",
+    "install:yt-dlp": "node scripts/install-yt-dlp.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1115.0",
     "@prisma/adapter-pg": "^7.9.1",
     "@prisma/client": "^7.9.1",
     "dotenv": "^17.4.2",

@@ -16,6 +16,11 @@ services:
 
     # --include=dev is load-bearing: Render sets NODE_ENV=production, and both
     # the build (prisma) and the start command (tsx) live in devDependencies.
+    #
+    # `npm run build` also downloads the yt-dlp binary into ./bin — Render's
+    # native Node runtime ships ffmpeg but not yt-dlp, and there is no apt or
+    # root here. See scripts/install-yt-dlp.mjs; it fails soft, so a GitHub
+    # outage degrades the audio endpoint rather than failing the deploy.
     buildCommand: npm install --include=dev && npm run build
     startCommand: npm start
 
@@ -41,5 +46,66 @@ services:
         sync: false
       # Comma-separated allowed socket origins — the Vercel domain, plus
       # http://localhost:3000 if you run the main app against this server.
+      #
+      # Applies to SOCKETS ONLY. The /audio/* endpoints are server-to-server and
+      # no browser may reach them, so they have no CORS handling at all.
       - key: CORS_ORIGIN
+        sync: false
+
+      # ----------------------------------------------------------------
+      # Audio extraction for the main app's admin hook editor
+      # ----------------------------------------------------------------
+      # This service also runs yt-dlp + ffmpeg to produce the decoded audio the
+      # hook editor draws its waveform from, because a Vercel function has
+      # neither binary nor a writable disk. Extracted audio is uploaded to the
+      # same R2 bucket the main app uses; the main app serves it from there.
+
+      # Where the yt-dlp binary lands during the build. Must match
+      # scripts/install-yt-dlp.mjs. Render checks out to /opt/render/project/src.
+      - key: YTDLP_PATH
+        value: /opt/render/project/src/bin/yt-dlp
+
+      # Shared secret the main app presents as `Authorization: Bearer <secret>`.
+      # Set the SAME value as AUDIO_SERVICE_SECRET in the Vercel project.
+      #
+      # Not optional in practice: /audio/* refuses every request when this is
+      # unset, deliberately — an unauthenticated endpoint that spawns yt-dlp on
+      # demand is a free CPU-and-bandwidth faucet, and this service's URL is not
+      # a secret. Generate with: openssl rand -base64 32
+      - key: AUDIO_SERVICE_SECRET
+        sync: false
+
+      # Same four values as the main app's Vercel project, verbatim — the whole
+      # arrangement depends on both writing to one bucket.
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_REGION
+        value: auto
+
+      # OPTIONAL, and only needed once YouTube starts refusing this service.
+      #
+      # YouTube challenges datacenter IPs ("Sign in to confirm you're not a
+      # bot") far more readily than home connections, and Render is a
+      # datacenter. Paste a Netscape cookies.txt from a signed-in THROWAWAY
+      # YouTube account — raw or base64; src/audio/cookies.ts accepts either and
+      # writes it to a file, because yt-dlp wants a path and the free plan has no
+      # secret files. These are full session credentials: never use a personal
+      # account, and expect to re-paste as they expire.
+      #
+      # Before reaching for this, note the cheaper fix: review songs from a
+      # machine on a home connection. The main app extracts locally and uploads
+      # to the same bucket, so production never asks YouTube at all.
+      - key: YTDLP_COOKIES
+        sync: false
+
+      # OPTIONAL. Forcing the mobile players sometimes sidesteps the bot check.
+      # Try "android,ios" if extraction starts failing. Left unset because which
+      # clients work changes with whatever YouTube ships.
+      - key: YTDLP_PLAYER_CLIENTS
         sync: false
