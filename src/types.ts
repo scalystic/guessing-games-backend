@@ -46,6 +46,14 @@ export type RoundResults = {
     title: string
     artist: string
     album: string | null
+    /// The film, when the track is from one. The reveal panel shows this next
+    /// to the artist; `album` is still sent because the client's art lookup
+    /// matches better against the store's own collection name.
+    ///
+    /// Hand-kept copy of RoundResults in the main app's
+    /// src/lib/multiplayer/types.ts — the two are wire-compatible by
+    /// convention, not by import, so a field added here has to be added there.
+    movie: string | null
     releaseYear: number | null
   }
   playerResults: RoundPlayerResult[]

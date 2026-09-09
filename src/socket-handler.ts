@@ -717,7 +717,9 @@ async function resolveRoundInner(
           // against this database) that this reveal panel never needed in the
           // first place; over-fetching them turns an unrelated DB drift into
           // an outage for every round in the room.
-          song: { select: { title: true, artist: true, album: true, releaseYear: true } },
+          song: {
+            select: { title: true, artist: true, album: true, movie: true, releaseYear: true },
+          },
         },
       },
     },
@@ -772,6 +774,7 @@ async function resolveRoundInner(
       title: multiRound.puzzle.song.title,
       artist: multiRound.puzzle.song.artist,
       album: multiRound.puzzle.song.album ?? null,
+      movie: multiRound.puzzle.song.movie ?? null,
       releaseYear: multiRound.puzzle.song.releaseYear ?? null,
     },
     playerResults,
