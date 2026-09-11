@@ -180,6 +180,7 @@ async function broadcastRoomState(io: Server, code: string) {
       seatIndex: p.seatIndex,
       score: p.score,
       roundsSolved: p.roundsSolved,
+      stageOneSolves: p.stageOneSolves,
       isHost: p.playerId === room.hostPlayerId,
       isWinner: p.isWinner,
     }
@@ -228,11 +229,16 @@ async function awardRoundScore(
   })
   if (!runRound || runRound.outcome === 'PENDING') return null
 
+  const solvedFirstStage = runRound.outcome === 'SOLVED' && runRound.stageReached === 1
+
   await prisma.multiplayerRoomPlayer.update({
     where: { roomId_playerId: { roomId, playerId } },
     data: {
       score: { increment: runRound.points },
       roundsSolved: runRound.outcome === 'SOLVED' ? { increment: 1 } : undefined,
+      // Tie-break counter, same one-time award as the score above — see
+      // compareStandings.
+      stageOneSolves: solvedFirstStage ? { increment: 1 } : undefined,
     },
   })
 
@@ -502,6 +508,7 @@ export function registerSocketHandlers(io: Server<ClientToServerEvents, ServerTo
           data: {
             score: 0,
             roundsSolved: 0,
+            stageOneSolves: 0,
             isWinner: false,
             finishedAt: null,
             runId: null,
@@ -910,17 +917,37 @@ function applyGraceDeadline(
   }, FIRST_FINISH_GRACE_MS)
 }
 
+/// Board order, best first. MIRROR of compareStandings in the main app's
+/// src/lib/multiplayer/standings.ts — the live board is sorted client-side and
+/// the final table server-side, and the two disagreeing means the leader
+/// visibly swaps at `game:end` for no reason a player can see.
+///
+/// Points alone tie constantly: STAGE_BASE is six fixed values, so two players
+/// who solved the same rounds off the same rungs finish dead level. The chain
+/// after it answers "who did it on less information": more 0.4s solves first
+/// (the hardest rung there is), then more songs solved, then seat order so the
+/// result is at least stable rather than whatever the DB returned.
+const compareStandings = (
+  a: { score: number; stageOneSolves: number; roundsSolved: number; seatIndex: number },
+  b: { score: number; stageOneSolves: number; roundsSolved: number; seatIndex: number },
+): number =>
+  b.score - a.score ||
+  b.stageOneSolves - a.stageOneSolves ||
+  b.roundsSolved - a.roundsSolved ||
+  a.seatIndex - b.seatIndex
+
 async function endGame(io: Server, code: string, roomId: string, mem: RoomMemory) {
-  const room = await prisma.multiplayerRoom.findUnique({
+  const found = await prisma.multiplayerRoom.findUnique({
     where: { id: roomId },
     include: {
-      players: {
-        include: { player: { select: { id: true, displayName: true } } },
-        orderBy: { score: 'desc' },
-      },
+      players: { include: { player: { select: { id: true, displayName: true } } } },
     },
   })
-  if (!room) return
+  if (!found) return
+  // Sorted here rather than by `orderBy: { score: 'desc' }`: the tie-break
+  // chain has to be the one the client already drew mid-game, and it lives in
+  // one comparator, not split between a Prisma clause and a JS one.
+  const room = { ...found, players: [...found.players].sort(compareStandings) }
 
   if (room.players.length > 0) {
     const winner = room.players[0]!
@@ -974,6 +1001,7 @@ async function endGame(io: Server, code: string, roomId: string, mem: RoomMemory
     displayName: rp.player.displayName ?? `Player ${rp.seatIndex + 1}`,
     score: rp.score,
     roundsSolved: rp.roundsSolved,
+    stageOneSolves: rp.stageOneSolves,
     isWinner: i === 0,
   }))
 

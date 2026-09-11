@@ -771,6 +771,12 @@ model MultiplayerRoomPlayer {
   runId         String?          @unique
   score         Int              @default(0)
   roundsSolved  Int              @default(0)
+  /// Rounds solved off the FIRST rung of the reveal ladder — 400ms today. The
+  /// room board's first tie-break: equal scores are common because STAGE_BASE
+  /// is a fixed six-value table, so a 4-way tie on points is a normal end to a
+  /// short game, not an edge case. Counted rather than derived from RunRound so
+  /// the LIVE board can order by it mid-game without a join per broadcast.
+  stageOneSolves Int             @default(0)
   totalRevealMs Int              @default(0)
   isWinner      Boolean          @default(false)
   joinedAt      DateTime         @default(now())

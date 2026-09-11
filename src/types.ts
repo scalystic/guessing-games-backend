@@ -15,6 +15,9 @@ export type RoomPlayerInfo = {
   seatIndex: number
   score: number
   roundsSolved: number
+  /// Rounds solved off the first rung of the ladder (0.4s). Sent live because
+  /// it is the board's first tie-break — see compareStandings.
+  stageOneSolves: number
   isHost: boolean
   isWinner: boolean
 }
@@ -69,6 +72,7 @@ export type FinalRanking = {
   displayName: string
   score: number
   roundsSolved: number
+  stageOneSolves: number
   isWinner: boolean
 }
 
