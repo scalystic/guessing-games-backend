@@ -635,6 +635,9 @@ model PlayerGameStat {
   runsPlayed   Int @default(0)
   roundsPlayed Int @default(0)
   roundsSolved Int @default(0)
+  /// Rounds solved on attempt 1 — "guessed in 0.4 seconds". Mirrors the
+  /// frontend schema; see its copy for the note on where it's written.
+  instantSolveCount Int @default(0)
 
   bestRunScore   Int @default(0)
   bestDailyScore Int @default(0)
